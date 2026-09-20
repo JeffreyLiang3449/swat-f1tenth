@@ -5,31 +5,6 @@ import math
 from sensor_msgs.msg import LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped
 
-def double_list_dump(var_name, array):
-    print_str = var_name + f' is: ['
-    for i in range(len(array)):
-        print_str += '['
-        for j in range(len(array[i])):
-            print_str += f'{array[i][j]}'
-            if not j == len(array[i]) - 1:
-                print_str += f', '
-            else:
-                print_str += f']'
-        if not i == len(array) - 1:
-            print_str += f', '
-        else:
-            print_str += f']'
-    print(print_str)
-
-def single_list_dump(var_name, array):
-    print_str = var_name + f' is: ['
-    for i in range(len(array)):
-        print_str += f'{array[i]:.2f}'
-        if not i == len(array) - 1:
-            print_str += f', '
-    print_str += f']'
-    print(print_str)
-
 class DisparityExtender(Node):
     def __init__(self):
         super().__init__('disparity_extender_node')
@@ -42,7 +17,7 @@ class DisparityExtender(Node):
             self.laser_callback,
             10
         )
-        self.move = self.create_publisher(AckermannDriveStamped, '/drive', 10)
+        self.move = self.create_publisher(AckermannDriveStamped, '/disp_drive', 10)
         self.get_logger().info('Disparity extender node initialized')
 
     def laser_callback(self, msg: LaserScan):
@@ -50,18 +25,21 @@ class DisparityExtender(Node):
         write_ranges = list(msg.ranges)
         read_ranges = read_ranges[::-1]
         write_ranges = write_ranges[::-1]
+        print(read_ranges[:20])
         
         for i in range(len(read_ranges)):
             if not math.isfinite(read_ranges[i]):
                 read_ranges[i] = msg.range_max
-            if read_ranges[i] <= 0.75:
+            if read_ranges[i] <= 1.25:
+                read_ranges[i] = 0
                 write_ranges[i] = 0
-
+        
+        num_rays = 10
         for j in range(1, len(read_ranges)):
             if abs(read_ranges[j] - read_ranges[j-1]) > 2.0:
                 if read_ranges[j] < read_ranges[j-1]:
                     num_rays = math.ceil(math.asin(min(1.0, 0.205 / max(read_ranges[j], 1e-6))) / msg.angle_increment)
-                    for k in range(j-1, max([0, j-num_rays]), -1):
+                    for k in range(j-1, max([-1, j-num_rays]), -1):
                         write_ranges[k] = 0
                 else:
                     num_rays = math.ceil(math.asin(min(1.0, 0.205 / max(read_ranges[j], 1e-6))) / msg.angle_increment)
@@ -83,13 +61,8 @@ class DisparityExtender(Node):
                 was_in_gap = True
         if was_in_gap:
             gap_indices.append((gap_start, 900))
-        try:
-            if num_rays > 0:
-                num_rays = num_rays
-        except NameError:
-            num_rays = 10
         gap_indices = [(c, d) for c, d in gap_indices if d - c > num_rays]
-        double_list_dump('gap_indices', gap_indices)
+        print(gap_indices)
         if len(gap_indices) == 0:
             stop_msg = AckermannDriveStamped()
             stop_msg.drive.steering_angle = 0.0
@@ -97,7 +70,7 @@ class DisparityExtender(Node):
             self.move.publish(stop_msg)
             return
         
-        gap_length_averages = [(sum(ranges[a:b]) / len(ranges[a:b])) for a, b in gap_indices]
+        gap_length_averages = [(sum(ranges[a:b]) / (b - a)) for a, b in gap_indices]
         max_dist_rep_indices = [index for index, value in enumerate(gap_length_averages) if value == max(gap_length_averages)]
         if len(max_dist_rep_indices) == 1:
             best_gap = gap_length_averages.index(max(gap_length_averages))
