@@ -1,0 +1,7 @@
+image: Random12.png
+resolution: 0.05
+origin: [-3.4998, -6.1764, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+initial_pose: [19.6013, 2.7361, 0.8546]
