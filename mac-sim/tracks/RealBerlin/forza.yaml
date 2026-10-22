@@ -1,0 +1,7 @@
+image: RealBerlin.png
+resolution: 0.05
+origin: [-11.6065, -26.5208, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+initial_pose: [9.7435, -7.1208, 0.0000]

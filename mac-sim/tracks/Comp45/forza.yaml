@@ -1,0 +1,7 @@
+image: Comp45.png
+resolution: 0.05
+origin: [-9.5580, -9.9369, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+initial_pose: [-0.5967, -3.8161, 0.5727]

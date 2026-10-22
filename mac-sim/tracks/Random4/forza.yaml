@@ -1,0 +1,7 @@
+image: Random4.png
+resolution: 0.05
+origin: [-3.4533, -1.1801, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+initial_pose: [19.8764, 9.3062, 1.7329]

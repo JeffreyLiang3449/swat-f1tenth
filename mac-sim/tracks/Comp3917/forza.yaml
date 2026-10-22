@@ -1,0 +1,7 @@
+image: Comp3917.png
+resolution: 0.05
+origin: [-11.0134, -6.3875, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+initial_pose: [-3.5262, 1.5208, -3.0705]

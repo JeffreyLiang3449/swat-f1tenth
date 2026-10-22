@@ -1,0 +1,12 @@
+# build artifacts and caches, not source
+.cache/
+__pycache__/
+*.pyc
+.DS_Store
+# upstream clones that rr fetches for you
+ws/build/
+ws/install/
+ws/log/
+ws/src/f1tenth_gym_ros/
+tracks/src/
+tracks/real_src/

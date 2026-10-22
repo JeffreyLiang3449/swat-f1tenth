@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# rr: one terminal command for the RoboRacer sim (in the OrbStack VM) and the real car (over SSH).
+# Run `rr help` for the list.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+VM=roboracer
+WS="$ROOT/ws"
+VNC_URL="http://localhost:6080/vnc.html?autoconnect=1&resize=remote"
+[ -f "$ROOT/car.env" ] && source "$ROOT/car.env"
+
+c_blue=$'\e[34m'; c_dim=$'\e[2m'; c_off=$'\e[0m'
+say() { echo "${c_blue}rr:${c_off} $*"; }
+die() { echo "rr: $*" >&2; exit 1; }
+
+# Run a command inside the VM with ROS sourced. Keeps a TTY when we have one (for Ctrl-C, teleop).
+vm() { orb -m "$VM" bash -c "source '$ROOT/scripts/env.sh' && cd '$WS' && $*"; }
+vm_running() { orbctl list 2>/dev/null | awk -v m="$VM" '$1==m{print $2}' | grep -q running; }
+ensure_vm() { vm_running || { say "starting VM $VM"; orbctl start "$VM" >/dev/null; }; }
+
+need_car() {
+  [ -n "${CAR_HOST:-}" ] || die "car not configured yet: edit $ROOT/car.env (CAR_HOST, CAR_USER)"
+}
+car_ssh() { ssh ${CAR_SSH_OPTS:-} "$CAR_USER@$CAR_HOST" "$@"; }
+# Remote-side paths stay unexpanded here (single quotes) so the car's shell resolves ~ and /opt/ros/*.
+CAR_WS="${CAR_WS:-}"; [ -n "$CAR_WS" ] || CAR_WS='~/f1tenth_ws'
+CAR_ROS_SETUP="${CAR_ROS_SETUP:-}"; [ -n "$CAR_ROS_SETUP" ] || CAR_ROS_SETUP='/opt/ros/$(ls /opt/ros | tail -1)/setup.bash'
+CAR_RMW="${CAR_RMW:-}"; [ -n "$CAR_RMW" ] || CAR_RMW='rmw_cyclonedds_cpp'   # must match the car's own setup
+car_env="export RMW_IMPLEMENTATION=$CAR_RMW && source $CAR_ROS_SETUP && cd $CAR_WS && { [ -f install/setup.bash ] && source install/setup.bash || true; }"
+
+start_vnc() {  # virtual display + noVNC web bridge in their own tmux session; restarted if the display stops answering
+  local on="${1:-vm}" port="${2:-6080}"
+  $on "timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/5901; head -c 3 <&3' >/dev/null 2>&1 && tmux has-session -t vnc 2>/dev/null || {
+        tmux kill-session -t vnc 2>/dev/null; pkill -9 -x Xvnc; rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+        tmux new-session -d -s vnc -n xvnc 'Xvnc :1 -geometry 1600x1000 -depth 24 -SecurityTypes None -localhost yes' &&
+        tmux new-window -t vnc -n wm '$ROOT/scripts/vnc_prep.sh; sleep 1; DISPLAY=:1 openbox' &&
+        tmux new-window -t vnc -n web 'websockify --web /usr/share/novnc '$port' localhost:5901'; sleep 2; }"
+}
+
+FVM=forzaeth
+FMAPS='~/ws/src/race_stack/stack_master/maps'   # expanded inside the VM
+FORZA_URL="http://localhost:6081/vnc.html?autoconnect=1&resize=remote"
+fvm() { orb -m "$FVM" bash -c "source '$ROOT/scripts/forza_env.sh' && cd ~/ws && $*"; }
+ensure_fvm() { orbctl list 2>/dev/null | awk -v m="$FVM" '$1==m{print $2}' | grep -q running || { say "starting VM $FVM"; orbctl start "$FVM" >/dev/null; }; }
+
+sim_config() {  # $1 = map name -> a sim.yaml for it (track maps also get their start pose + a fitted top view)
+  local map="$1" src="$WS/src/f1tenth_gym_ros/config/sim.yaml" out="$ROOT/.cache/sim.yaml"
+  local track="$ROOT/tracks/$1" sx=-12.0 sy=0.0 st=0.0 path="$1"
+  mkdir -p "$ROOT/.cache"
+  if [ -f "$track/$map.yaml" ]; then
+    path="$track/$map"; read -r sx sy st < "$track/start_pose.txt"
+  elif [ -f "$WS/src/f1tenth_gym_ros/maps/$map.yaml" ]; then
+    path="maps/$map"
+  else
+    die "unknown map '$map' (rr maps)"
+  fi
+  echo "$sx $sy $st" > "$ROOT/.cache/start_pose.txt"
+  sed -e "s|^\([[:space:]]*map_path:\).*|\1 '$path'|" \
+      -e "s|^\([[:space:]]*sx:\).*|\1 $sx|" -e "s|^\([[:space:]]*sy:\).*|\1 $sy|" \
+      -e "s|^\([[:space:]]*stheta:\).*|\1 $st|" "$src" > "$out"
+  # "top" camera fitted to this map: centered on the drivable area, scaled to fit ~1300x850 px
+  python3 - "$path" "$WS/src/f1tenth_gym_ros" "$ROOT/config/rviz/top.rviz" "$ROOT/.cache/top.rviz" <<'PY'
+import sys, re, numpy as np
+from pathlib import Path
+from PIL import Image
+path, pkg, tmpl, out = sys.argv[1:]
+y = Path(path + '.yaml') if path.startswith('/') else Path(pkg) / (path + '.yaml')
+spec = dict(l.split(':', 1) for l in y.read_text().splitlines() if ':' in l)
+spec = {'image': spec['image'].strip(), 'resolution': float(spec['resolution']), 'origin': [float(v) for v in spec['origin'].strip(' []').split(',')]}
+a = np.array(Image.open(y.parent / spec['image']).convert('L'))
+rows, cols = np.where(a > 128) if (a > 128).mean() < 0.5 else np.where(a < 128)
+res, (ox, oy) = spec['resolution'], spec['origin'][:2]
+x0, x1 = ox + cols.min() * res, ox + cols.max() * res
+y0, y1 = oy + (a.shape[0] - rows.max()) * res, oy + (a.shape[0] - rows.min()) * res
+scale = 0.95 * min(1300 / (x1 - x0), 850 / (y1 - y0))
+t = Path(tmpl).read_text()
+t = re.sub(r'Scale: [0-9.]+', f'Scale: {scale:.2f}', t)
+t = re.sub(r'\n      X: [-0-9.]+\n      Y: [-0-9.]+', f'\n      X: {(x0+x1)/2:.2f}\n      Y: {(y0+y1)/2:.2f}', t)
+Path(out).write_text(t)
+PY
+  echo "$out"
+}
+
+usage() {
+cat <<HELP
+${c_blue}rr${c_off} - RoboRacer control   ${c_dim}($ROOT)${c_off}
+
+${c_blue}Simulator${c_off} (Ubuntu VM "$VM", ROS 2 Humble)
+  rr sim [track]        start sim + RViz (default Comp1). rr maps lists every track
+  rr track new [seed]   generate a competition-style track (rules-based: 1.2 m+ wide, duct walls, hairpins)
+                        same seed = same track, e.g. rr track new 5 makes Comp5
+  rr sim-opp [n]        same, with n cars (you + n-1 opponents)
+  rr maps               list maps
+  rr viz                open RViz in your browser
+  rr view follow|chase|top|orbit   camera: above the car (default) / behind the car / whole track / free 3D
+  rr stop               stop the sim
+  rr logs               attach to the sim's tmux (Ctrl-b d to detach, Ctrl-b n next window)
+  rr reset              put the car back on the start line (crashes do this automatically)
+  rr crashes            how many times it has crashed this session
+  rr laps               lap times so far (timed at the start line; a crash cancels the lap)
+  rr teleop             drive the sim car with the keyboard (i/j/l/, keys, k = stop)
+
+${c_blue}Algorithms${c_off} (ws/src/racer_algos/racer_algos/*.py)
+  rr ps                 what's running right now (sim, algorithm, nodes)
+  rr list               list algorithms
+  rr new <name>         make a new algorithm from the template
+  rr build              colcon build the workspace
+  rr run <algo> [args]  run an algorithm against the sim (Ctrl-C stops the car)
+  rr param <algo> <k> <v>  change a parameter while it runs
+
+${c_blue}ROS tools${c_off}
+  rr topics             list topics          rr echo <topic>   print a topic
+  rr ros <args...>      any ros2 command, e.g. rr ros node list
+  rr shell              bash inside the VM, ROS already sourced
+
+${c_blue}Real car${c_off} (set CAR_HOST/CAR_USER in car.env)
+  rr car                ssh into the car
+  rr car-key            copy your SSH key to the car (once; no more passwords)
+  rr car-start          start EVERYTHING on the car (drivers + odometry + SLAM), survives disconnects
+  rr car-stop-all       stop all of it
+  rr car-logs [window]  watch the car's logs (drivers | odom | slam)
+  rr car-bringup        start just the drivers, in this terminal (dies if the connection drops)
+  rr car-push           copy racer_algos to the car and build it there
+  rr car-run <algo>     run an algorithm on the car (IT MOVES IMMEDIATELY; rr car-stop to stop)
+  rr car-topics         list topics on the car
+  rr car-forza-setup    install ForzaETH on the car in Docker (one time, 10-40 min)
+  rr car-forza          open a shell inside the car's ForzaETH container
+  rr car-odom-setup     install laser odometry on the car (one time; needed because the VESC gives none)
+  rr car-odom           start lidar+IMU odometry (leave running; needed before rr car-map)
+  rr car-check          is everything the mapping needs actually working?
+  rr car-map            start SLAM mapping on the car (then drive a slow lap)
+  rr car-map-view       peek at the map built so far (opens a picture on your Mac)
+  rr car-map-save <name>   save the map, copy it here, and build a sim + ForzaETH track from it
+  rr car-stop           EMERGENCY STOP: kill the algorithm and send zero speed to the car
+  rr car-clean          clear stale DDS files on the car (fixes "std::bad_alloc" at bringup)
+
+${c_blue}ForzaETH${c_off} (ETH Zurich race stack, separate VM "forzaeth", RViz on port 6081)
+  rr forza sim [map]    start their sim (rr forza maps: their 3 tracks + Comp1-Comp8)
+  rr forza race [MAP|PP]   time trials along the optimal raceline (MAP = their controller, PP = pure pursuit)
+  rr forza h2h          head-to-head with an opponent (overtaking with the spliner planner)
+  rr forza addmap <track>  give one of your tracks to ForzaETH (computes its race line, a few seconds)
+  rr forza maps         maps ForzaETH can drive
+  rr forza switch <map> [speed]   stop, load another map, start racing (keeps your browser tab)
+  rr forza speed <0-1>  whole-lap speed as a fraction of the race line's speed (starts at 0.5)
+  rr forza sector <n> <0-1>  speed for one sector (split the lap into sectors in speed_scaling.yaml)
+  rr forza laps         lap times so far (the number you're tuning)
+  rr forza param <node> <name> <value>   change any setting live, e.g. rr forza param controller m_l1 0.35
+  rr forza params [node]   list settings (default: controller)
+  rr forza viz | stop | logs | shell | build | setup
+
+${c_blue}Machine${c_off}
+  rr status             VM + sim status       rr up / rr down   start/stop the VM
+  rr setup              (re)install everything in the VM
+HELP
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  help|-h|--help) usage ;;
+
+  up)     orbctl start "$VM"; say "VM up" ;;
+  down)   orbctl stop "$VM" "$FVM" 2>/dev/null; say "VMs stopped (frees their RAM)" ;;
+  setup)  ensure_vm; orb -m "$VM" bash "$ROOT/scripts/vm_setup.sh" ;;
+  shell)  ensure_vm; orb -m "$VM" bash -i ;;
+  status)
+    orbctl list
+    vm_running && vm "tmux has-session -t sim 2>/dev/null && echo 'sim: running' || echo 'sim: stopped'" || true
+    # ping is blocked on this car, so test the thing we actually use: SSH
+    [ -n "${CAR_HOST:-}" ] && { nc -z -w 3 "$CAR_HOST" 22 >/dev/null 2>&1 && echo "car: $CAR_HOST reachable (ssh)" || echo "car: $CAR_HOST not reachable"; } || echo "car: not configured (car.env)"
+    ;;
+
+  build)  ensure_vm; vm "colcon build --symlink-install ${*:-}" ;;
+
+  sim|sim-opp)
+    ensure_vm
+    if [ "$cmd" = sim-opp ]; then map=Comp1; n="${1:-2}"; else map="${1:-Comp1}"; n=1; fi
+    cfg="$(sim_config "$map")"
+    vm "tmux has-session -t sim 2>/dev/null" && die "sim already running (rr stop first, or rr logs)"
+    start_vnc
+    vm "tmux new-session -d -s sim -n gym 'source $ROOT/scripts/env.sh; ros2 launch f1tenth_gym_ros gym_bridge_launch.py open_foxglove:=false config:=$cfg num_agent:=$n; read' &&
+        tmux new-window -t sim -n rviz 'source $ROOT/scripts/env.sh; sleep 3; rviz2 -d $ROOT/config/rviz/follow.rviz; read' &&
+        tmux new-window -d -t sim -n reset 'source $ROOT/scripts/env.sh; sleep 5; python3 $ROOT/scripts/auto_reset.py \$(cat $ROOT/.cache/start_pose.txt); read'"
+    say "sim running on map '$map' with $n car(s)"
+    say "RViz: $VNC_URL"
+    say "next: ${c_dim}rr run follow_the_gap${c_off}   or   ${c_dim}rr teleop${c_off}"
+    sleep 4; open "$VNC_URL"
+    ;;
+  view)
+    v="${1:-follow}"; cfg="$ROOT/config/rviz/$v.rviz"
+    [ "$v" = top ] && [ -f "$ROOT/.cache/top.rviz" ] && cfg="$ROOT/.cache/top.rviz"
+    [ -f "$cfg" ] || die "views: follow chase top orbit"
+    vm "tmux kill-window -t sim:rviz 2>/dev/null; tmux new-window -d -t sim -n rviz 'source $ROOT/scripts/env.sh; rviz2 -d $cfg; read'"
+    say "RViz camera: $v" ;;
+  track)
+    [ "${1:-}" = new ] || die "usage: rr track new [seed]"
+    out="$(python3 "$ROOT/scripts/comp_track.py" ${2:-})"; echo "$out"
+    name="$(awk 'NR==1{print $1}' <<<"$out")"
+    say "made $name.  drive it: ${c_dim}rr stop; rr sim $name${c_off}   give it to ForzaETH: ${c_dim}rr forza addmap $name${c_off}" ;;
+  maps)   echo "Competition-style (small, twisty, duct walls):"; ls "$ROOT/tracks" | grep -E '^Comp' | column -c 100
+          echo "Practice:"; ls "$ROOT/tracks" | grep -E '^(Squiggle|Random)' | column -c 100
+          echo "Real F1 circuits (big, 250-550 m laps):"; ls "$ROOT/tracks" | grep -v -E '^(src|Squiggle|Random|Comp)' | column -c 100
+          echo "F1TENTH lab maps: levine_blocked levine_obs levine (open ends) blank" ;;
+  viz)    start_vnc; open "$VNC_URL" ;;
+  stop)   vm "tmux kill-session -t sim 2>/dev/null; pkill -f '[g]ym_bridge'; pkill -f '[r]viz2'; pkill -f '[f]oxglove_bridge'; pkill -f '[m]ap_server'; true"; say "sim stopped" ;;
+  logs)   orb -m "$VM" tmux attach -t sim ;;
+  reset)   vm "python3 $ROOT/scripts/auto_reset.py \$(cat $ROOT/.cache/start_pose.txt) --once" ;;
+  laps)    vm "tmux capture-pane -p -J -t sim:reset -S -20000 | grep -o 'lap #.*'" || echo "no laps yet" ;;
+  crashes) n=$(vm "tmux capture-pane -p -t sim:reset -S -5000 | grep -c 'crash #'" || true); echo "crashes this sim: ${n:-0}" ;;
+  teleop) vm "ros2 run teleop_twist_keyboard teleop_twist_keyboard" ;;
+
+  ps)
+    ensure_vm
+    nodes="$(vm "ros2 node list 2>/dev/null" || true)"
+    running=""
+    for algo in $("$0" list); do grep -qx "/$algo" <<<"$nodes" && running+="$algo "; done
+    vm "tmux has-session -t sim 2>/dev/null" && echo "sim:        running" || echo "sim:        stopped"
+    echo "algorithm:  ${running:-none}"
+    echo "ROS nodes:"; sed 's/^/  /' <<<"${nodes:-}" ;;
+  list)   ls "$WS/src/racer_algos/racer_algos/" | grep -v '^_' | grep '\.py$' | sed 's/\.py$//' ;;
+  new)
+    name="${1:-}"; [[ "$name" =~ ^[a-z][a-z0-9_]*$ ]] || die "usage: rr new <name>  (lowercase, letters/digits/_)"
+    f="$WS/src/racer_algos/racer_algos/$name.py"
+    [ -e "$f" ] && die "$f already exists"
+    sed "s/NAME/$name/g" "$WS/src/racer_algos/racer_algos/_template.py" > "$f"
+    say "created $f"
+    ensure_vm; vm "colcon build --symlink-install --packages-select racer_algos" >/dev/null && say "built. try: rr run $name"
+    ;;
+  run)
+    algo="${1:-}"; [ -n "$algo" ] || die "usage: rr run <algo>   (see rr list)"; shift
+    ensure_vm; vm "ros2 run racer_algos $algo --ros-args -p odom_topic:=/ego_racecar/odom $*" ;;
+  param)  [ $# -eq 3 ] || die "usage: rr param <algo> <name> <value>"; vm "ros2 param set /$1 $2 $3" ;;
+
+  topics) vm "ros2 topic list" ;;
+  echo)   vm "ros2 topic echo ${1:?topic} ${2:-}" ;;
+  ros)    vm "ros2 $*" ;;
+
+  car)          need_car; car_ssh ;;
+  car-key)      need_car; [ -f ~/.ssh/id_ed25519.pub ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519; ssh-copy-id "$CAR_USER@$CAR_HOST" ;;
+  car-start)
+    need_car
+    rsync -az "$ROOT/scripts/car_session.sh" "$ROOT/scripts/car_odom.sh" "$ROOT/scripts/scan_relay.py" \
+          "$ROOT/config/car/ekf.yaml" "$CAR_USER@$CAR_HOST:/tmp/"
+    car_ssh "mkdir -p ~/.ros"
+    rsync -az "$ROOT/config/car/cyclonedds.xml" "$CAR_USER@$CAR_HOST:.ros/cyclonedds.xml"
+    say "starting drivers, odometry and SLAM on the car (about 30 s)..."
+    car_ssh "bash /tmp/car_session.sh start"
+    say "running in the background on the car. Check it with: ${c_dim}rr car-check${c_off}"
+    say "it keeps running even if this terminal or the Wi-Fi drops" ;;
+  car-stop-all)
+    need_car
+    rsync -az "$ROOT/scripts/car_session.sh" "$CAR_USER@$CAR_HOST:/tmp/" 2>/dev/null
+    car_ssh "bash /tmp/car_session.sh stop" ;;
+  car-logs)
+    need_car
+    w="${1:-slam}"
+    car_ssh -t "tmux attach -t rr \; select-window -t $w" ;;
+  car-bringup)
+    need_car
+    # Leftover drivers from an earlier run fight over the VESC's USB port ("Out-of-sync with VESC"),
+    # so always start from a clean slate.
+    car_ssh "pkill -f '[r]os2 launch'; pkill -f '[v]esc_driver'; pkill -f '[u]rg_node'; pkill -f '[a]ckermann_mux'; pkill -f '[j]oy_teleop'; sleep 2; true"
+    car_ssh -t "bash -lc '$car_env && ${CAR_BRINGUP:-ros2 launch f1tenth_stack bringup_launch.py}'" ;;
+  car-forza-setup)
+    need_car
+    say "copying the installer to the car and running it (this takes a while; it downloads a Humble image)"
+    rsync -az "$ROOT/scripts/car_forza_setup.sh" "$CAR_USER@$CAR_HOST:/tmp/car_forza_setup.sh"
+    car_ssh -t "bash /tmp/car_forza_setup.sh ${1:-SWAT}" ;;
+  car-forza)
+    need_car
+    svc="${CAR_FORZA_SERVICE:-}"
+    [ -n "$svc" ] || svc=$(car_ssh 'a=$(uname -m); [ "$a" = x86_64 ] && echo x86 || { [ "$a" = aarch64 ] && echo jet || echo arm; }')
+    car_ssh -t "cd ~/race_stack && docker compose up -d $svc >/dev/null 2>&1; docker compose exec $svc bash" ;;
+  car-odom-setup)
+    need_car
+    rsync -az "$ROOT/scripts/car_laser_odom_setup.sh" "$CAR_USER@$CAR_HOST:/tmp/"
+    car_ssh -t "bash /tmp/car_laser_odom_setup.sh" ;;
+  car-odom)
+    need_car
+    rsync -az "$ROOT/scripts/car_odom.sh" "$ROOT/config/car/ekf.yaml" "$CAR_USER@$CAR_HOST:/tmp/"
+    say "lidar odometry + IMU, fused. Leave this tab open, then map in another tab: rr car-map"
+    car_ssh -t "bash /tmp/car_odom.sh /tmp/ekf.yaml" ;;
+  car-check)
+    need_car
+    car_ssh "mkdir -p ~/.ros" && rsync -az "$ROOT/config/car/cyclonedds.xml" "$CAR_USER@$CAR_HOST:.ros/cyclonedds.xml"
+    rsync -az "$ROOT/scripts/car_check.sh" "$CAR_USER@$CAR_HOST:/tmp/"
+    car_ssh "bash /tmp/car_check.sh" ;;
+  car-map)
+    need_car
+    cfg="$CAR_WS/src/f1tenth_system/f1tenth_stack/config/f1tenth_online_async.yaml"
+    say "SLAM starting. Leave this tab RUNNING. Drive a slow lap, check progress with rr car-map-view,"
+    say "then save from another tab: rr car-map-save <name>"
+    # run the node directly: their launch file ignores the config file and uses its own frame names
+    car_ssh -t "bash -lc '$car_env && ros2 run slam_toolbox async_slam_toolbox_node --ros-args --params-file $cfg'" ;;
+  car-map-view)
+    need_car
+    car_ssh "bash -lc '$car_env && ros2 topic list | grep -qx /map'" ||
+      die "no /map yet: is 'rr car-map' running in another tab?"
+    car_ssh "bash -lc '$car_env && rm -f /tmp/_peek.* && ros2 run nav2_map_server map_saver_cli -f /tmp/_peek --ros-args -p save_map_timeout:=20 -p free_thresh_default:=0.25 -p occupied_thresh_default:=0.65'" ||
+      die "map_saver could not read /map (its error is above). SLAM may not have published a map yet: drive a little, then retry"
+    mkdir -p "$ROOT/.cache"
+    rsync -az "$CAR_USER@$CAR_HOST:/tmp/_peek.*" "$ROOT/.cache/" 2>/dev/null
+    python3 - "$ROOT/.cache" <<'PY'
+from PIL import Image
+from pathlib import Path
+import sys
+d = Path(sys.argv[1])
+src = next((p for p in (d / '_peek.pgm', d / '_peek.png') if p.exists()), None)
+if src is None:
+    raise SystemExit('no map file came back')
+im = Image.open(src).convert('L')
+a = im.point(lambda v: 255 if v > 250 else (0 if v < 100 else 160))   # free / wall / unknown
+a.resize((im.width * 2, im.height * 2), Image.NEAREST).save(d / 'map_preview.png')
+print(f'mapped area: {im.width}x{im.height} cells')
+PY
+    open "$ROOT/.cache/map_preview.png"
+    say "snapshot of the map so far (run this again any time to refresh)" ;;
+  car-map-save)
+    need_car
+    n="${1:?usage: rr car-map-save <name>   e.g. rr car-map-save swat1}"
+    car_ssh "bash -lc '$car_env && ros2 topic list | grep -qx /map'" ||
+      die "no /map on the car: 'rr car-map' must still be RUNNING in its own tab while you save"
+    car_ssh "bash -lc '$car_env && ros2 run nav2_map_server map_saver_cli -f /tmp/$n --ros-args -p save_map_timeout:=20'" ||
+      die "map save failed. Leave 'rr car-map' running, drive a full lap, then try again"
+    mkdir -p "$ROOT/tracks/real_src/car"
+    rsync -az "$CAR_USER@$CAR_HOST:/tmp/$n.*" "$ROOT/tracks/real_src/car/"
+    say "map copied to tracks/real_src/car/$n.*"
+    python3 "$ROOT/scripts/import_real.py" "$n" "$ROOT/tracks/real_src/car/$n.yaml" || die "could not clean the map (is the loop closed?)"
+    ensure_fvm && orb -m "$FVM" bash "$ROOT/scripts/forza_addmap.sh" "$n" &&
+      python3 "$ROOT/scripts/import_real.py" --centerline "$n"
+    say "done: ${c_dim}rr sim $n${c_off} (your algorithms)  ${c_dim}rr forza sim $n; rr forza race${c_off} (ForzaETH)" ;;
+  car-stop)
+    need_car
+    car_ssh "pkill -f '[r]acer_algos' ; true"
+    car_ssh "bash -lc '$car_env && timeout 3 ros2 topic pub -r 20 /drive ackermann_msgs/msg/AckermannDriveStamped \"{drive: {speed: 0.0, steering_angle: 0.0}}\" >/dev/null 2>&1; true'"
+    say "STOPPED: algorithm killed, zero speed sent" ;;
+  car-clean)
+    need_car
+    car_ssh "pkill -f '[r]os2 launch' ; pkill -f '[r]acer_algos' ; sleep 1; rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null; ls /dev/shm | wc -l"
+    say "cleaned; now run rr car-bringup again" ;;
+  car-topics)   need_car; car_ssh -t "bash -lc '$car_env && ros2 topic list'" ;;
+  car-push)
+    need_car
+    car_ssh "mkdir -p $CAR_WS/src"
+    rsync -az --delete --exclude __pycache__ "$WS/src/racer_algos/" "$CAR_USER@$CAR_HOST:$CAR_WS/src/racer_algos/"
+    car_ssh "bash -lc '$car_env && colcon build --symlink-install --packages-select racer_algos'"
+    say "racer_algos pushed and built on the car"
+    ;;
+  car-run)
+    need_car; algo="${1:-}"; [ -n "$algo" ] || die "usage: rr car-run <algo>"; shift
+    car_ssh -t "bash -lc '$car_env && ros2 run racer_algos $algo --ros-args -p odom_topic:=${CAR_ODOM:-/odom} $*'" ;;
+
+  forza)
+    sub="${1:-help}"; shift || true
+    ensure_fvm
+    case "$sub" in
+      setup) orb -m "$FVM" bash "$ROOT/scripts/forza_setup.sh" ;;
+      build) fvm "colcon build --symlink-install ${*:-}" ;;
+      shell) orb -m "$FVM" bash -c "cd ~/ws && exec bash --rcfile <(cat ~/.bashrc; echo source $ROOT/scripts/forza_env.sh) -i" ;;
+      sim)
+        map="${1:-glc_ot_ez}"
+        fvm "tmux has-session -t fsim 2>/dev/null" && die "forza sim already running (rr forza stop)"
+        start_vnc fvm 6081
+        fvm "tmux new-session -d -s fsim -n zenoh 'source $ROOT/scripts/forza_env.sh; ros2 run rmw_zenoh_cpp rmw_zenohd; read' &&
+             tmux new-window -t fsim -n base 'source $ROOT/scripts/forza_env.sh; sleep 3; ros2 launch stack_master base_system_launch.xml map_name:=$map sim:=true racecar_version:=SIM; read'"
+        fvm "tmux new-window -d -t fsim -n start 'bash $ROOT/scripts/forza_start.sh $map; read'"
+        say "ForzaETH sim starting on '$map'.  RViz: $FORZA_URL"
+        say "next: ${c_dim}rr forza race${c_off}  (or rr forza h2h)"
+        [ -n "${RR_NO_OPEN:-}" ] || { sleep 6; open "$FORZA_URL"; } ;;
+      race|h2h)
+        algo="${1:-MAP}"
+        if [ "$sub" = race ]; then launch=time_trials_launch.xml; else launch=head_to_head_launch.xml; fi
+        fvm "tmux has-session -t fsim 2>/dev/null" || die "start the sim first: rr forza sim"
+        fvm "tmux kill-window -t fsim:drive 2>/dev/null; tmux new-window -t fsim -n drive 'source $ROOT/scripts/forza_env.sh; ros2 launch stack_master $launch racecar_version:=SIM ctrl_algo:=$algo; read'"
+        say "ForzaETH $sub running with controller $algo (rr forza logs to watch, Ctrl-b n to switch windows)" ;;
+      switch)
+        m="${1:?usage: rr forza switch <map> [speed]   (rr forza maps)}"
+        fvm "[ -d $FMAPS/$m ]" || die "ForzaETH has no map '$m' (rr forza maps; add one with rr forza addmap)"
+        "$0" forza stop >/dev/null
+        RR_NO_OPEN=1 "$0" forza sim "$m" >/dev/null
+        say "loading $m..."
+        for _ in $(seq 1 40); do fvm "ros2 node list 2>/dev/null | grep -q sector_tuner" && break; sleep 1; done
+        sleep 4
+        "$0" forza race >/dev/null
+        if [ -n "${2:-}" ]; then sleep 4; "$0" forza speed "$2" >/dev/null; fi
+        say "racing on $m${2:+ at speed $2}. lap times: rr forza laps" ;;
+      maps) fvm "ls $FMAPS | grep -v '^PTest$'" ;;
+      laps) fvm "tmux capture-pane -p -J -t fsim:base -S -20000 | grep -o 'completed lap #[0-9]* in [0-9.]*' | sed 's/completed //'" || true ;;
+      param)
+        [ $# -eq 3 ] || die "usage: rr forza param <node> <name> <value>   e.g. rr forza param controller m_l1 0.35"
+        fvm "ros2 param set /$1 $2 $3" ;;
+      params) fvm "ros2 param dump /${1:-controller} 2>/dev/null | grep -v -E 'use_sim_time|qos_overrides|reliability|history|depth|durability|publisher|/parameter_events'" ;;
+      speed)
+        v="${1:?usage: rr forza speed 0.6   (fraction of the race line speed, 0-1)}"
+        orb -m "$FVM" bash "$ROOT/scripts/forza_speed.sh" "$v"
+        say "resets when the sim restarts; to keep it, edit the map's speed_scaling.yaml" ;;
+      sector)
+        [ $# -eq 2 ] || die "usage: rr forza sector <number> <0-1>   e.g. rr forza sector 2 0.4"
+        fvm "ros2 param set /sector_tuner Sector$1.scaling $2" ;;
+      addmap)
+        t="${1:?usage: rr forza addmap <track>   (rr maps)}"
+        [ -f "$ROOT/tracks/$t/forza.yaml" ] || die "no track '$t' in tracks/ (rr maps)"
+        say "computing ForzaETH race line for $t (low priority, usually under a minute)..."
+        orb -m "$FVM" bash "$ROOT/scripts/forza_addmap.sh" "$t" \
+          && say "done. drive it: ${c_dim}rr forza sim $t; rr forza race${c_off}" ;;
+      stop) fvm "tmux kill-session -t fsim 2>/dev/null; pkill -f '[r]os2 launch'; pkill -f '[r]mw_zenohd'; pkill -f '[r]viz2'; pkill -f '[g]ym_bridge'; true"; say "forza sim stopped" ;;
+      logs) orb -m "$FVM" tmux attach -t fsim ;;
+      *) die "rr forza sim | race | h2h | viz | stop | logs | shell | build | setup" ;;
+    esac ;;
+
+  *) die "unknown command '$cmd' (rr help)" ;;
+esac
