@@ -11,6 +11,6 @@ Once you have that done, follow the instructions below.
 3. Clone the repo
 4. Build the workspace with ```colcon build```
 5. Run ```source install/setup.bash```
-6. You should now be able to use our algorithms!
+6. You should now be able to use our algorithms! *Note: PPO algorithm requires more setup*
 
 This is a development branch!!!!!!!

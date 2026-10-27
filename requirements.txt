@@ -1,0 +1,8 @@
+#SEE README.md for installation instructions
+
+stable-baselines3
+gymnasium
+tensorboard
+
+numpy
+scipy
