@@ -65,7 +65,7 @@ class Dist_Finder_Node(Node):
         self.theta = self.kp * self.error + self.kd * derivative + self.ki * self.integral
         self.prev_error = self.error
         msg = PIDInput()
-        msg.theta = self.theta
+        msg.theta = -self.theta
         self.pid_pub.publish(msg)
 
 def main(args=None):

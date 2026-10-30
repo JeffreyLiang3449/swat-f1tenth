@@ -1,2 +1,10 @@
-f1tenth_gym_ros/
-f1tenth_racetracks/
+build/
+install/
+log/
+__pycache__/
+*.pyc
+*.egg-info/
+.vscode/
+*.db3
+*.mcap
+rosbag2_*/
