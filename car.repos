@@ -1,0 +1,5 @@
+repositories:
+  f1tenth_system:
+    type: git
+    url: https://github.com/Swat-F1tenth/f1tenth_system.git
+    version: swat-foxy

@@ -1,14 +1,34 @@
-# Swat Robotics F1TENTH GitHub Repository
+# Swarthmore Roboracer (F1TENTH)
 
+Team ROS 2 (Foxy) code. `auto/` holds all driving algorithms; `pid_msgs/` is
+the message used by wall following (dist_finder -> pid).
 
-Welcome to the GitHub repository for Swarthmore College's F1TENTH team! Below are instructions for using this repo. First, [download ROS 2 Foxy](https://docs.ros.org/en/foxy/Installation.html)
-and make sure you have the [f1tenth_gym repository](https://github.com/f1tenth/f1tenth_gym_ros) installed on your computer (switch this for the [f1tenth_system repository](https://github.com/f1tenth/f1tenth_system)
-if you are iterating with the F1TENTH vehicle).
+## Set up the car (Jetson)
+    mkdir -p ~/swat_ws/src && cd ~/swat_ws/src
+    git clone https://github.com/ORG/swat-f1tenth.git
+    vcs import < swat-f1tenth/car.repos
+    git -C f1tenth_system submodule update --init --recursive
+    cd ~/swat_ws
+    rosdep install --from-paths src --ignore-src -y
+    colcon build --symlink-install
+    source install/setup.bash
 
-Once you have that done, follow the instructions below.
+Our car-specific changes (VESC calibration, joystick/lidar config, bringup
+launch, odometry fix in vesc_to_odom) live on the `swat-foxy` branch of our
+forks of f1tenth_system and vesc.
 
-2. In a bash terminal, navigate to your f1tenth workspace's src folder.
-3. Clone the repo
-4. Build the workspace with ```colcon build```
-5. Run ```source install/setup.bash```
-6. You should now be able to use our algorithms!
+## Set up a laptop (simulator)
+    mkdir -p ~/swat_ws/src && cd ~/swat_ws/src
+    git clone https://github.com/ORG/swat-f1tenth.git
+    vcs import < swat-f1tenth/sim.repos
+    cd ~/swat_ws
+    rosdep install --from-paths src --ignore-src -y
+    colcon build --symlink-install
+
+## Daily workflow
+    cd ~/swat_ws/src/swat-f1tenth && git pull
+    cd ~/swat_ws && colcon build --symlink-install
+
+## Rules
+- Never push to main directly; open a pull request.
+- Don't edit code on the Jetson; develop on a laptop, then pull.

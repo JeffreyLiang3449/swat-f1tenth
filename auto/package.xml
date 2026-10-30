@@ -4,15 +4,18 @@
   <name>auto</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="swatrobotics@todo.todo">swatrobotics</maintainer>
-  <license>TODO: License declaration</license>
-
-  <depend>rclpy</depend>
+  <maintainer email="swat-roboracer-2026@todo.todo">swat-roboracer-2026</maintainer>
+  <license>Apache-2.0</license>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>ackermann_msgs</exec_depend>
+  <exec_depend>pid_msgs</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>
